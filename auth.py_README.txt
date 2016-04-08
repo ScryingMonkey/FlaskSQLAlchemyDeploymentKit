@@ -1,0 +1,157 @@
+from:
+http://stackoverflow.com/questions/9499286/using-google-oauth2-with-flask
+
+
+Another answer mentions Flask-Rauth, but doesn't go into detail about how to use it. There are a few Google-specific gotchas, but I have implemented it finally and it works well. I integrate it with Flask-Login so I can decorate my views with useful sugar like @login_required.
+
+I wanted to be able to support multiple OAuth2 providers, so part of the code is generic and based on Miguel Grinberg's excellent post about supporting OAuth2 with Facebook and Twitter here.
+
+First, add your specific Google authentication information from Google into your app's configuration:
+
+GOOGLE_LOGIN_CLIENT_ID = "<your-id-ending-with>.apps.googleusercontent.com"
+GOOGLE_LOGIN_CLIENT_SECRET = "<your-secret>"
+
+OAUTH_CREDENTIALS={
+        'google': {
+            'id': GOOGLE_LOGIN_CLIENT_ID,
+            'secret': GOOGLE_LOGIN_CLIENT_SECRET
+        }
+}
+And when you create your app (in my case, the module's __init__.py):
+
+app = Flask(__name__)
+app.config.from_object('config')
+In your app module, create auth.py:
+
+from flask import url_for, current_app, redirect, request
+from rauth import OAuth2Service
+
+import json, urllib2
+
+class OAuthSignIn(object):
+    providers = None
+
+    def __init__(self, provider_name):
+        self.provider_name = provider_name
+        credentials = current_app.config['OAUTH_CREDENTIALS'][provider_name]
+        self.consumer_id = credentials['id']
+        self.consumer_secret = credentials['secret']
+
+    def authorize(self):
+        pass
+
+    def callback(self):
+        pass
+
+    def get_callback_url(self):
+        return url_for('oauth_callback', provider=self.provider_name,
+                        _external=True)
+
+    @classmethod
+    def get_provider(self, provider_name):
+        if self.providers is None:
+            self.providers={}
+            for provider_class in self.__subclasses__():
+                provider = provider_class()
+                self.providers[provider.provider_name] = provider
+        return self.providers[provider_name]
+
+class GoogleSignIn(OAuthSignIn):
+    def __init__(self):
+        super(GoogleSignIn, self).__init__('google')
+        googleinfo = urllib2.urlopen('https://accounts.google.com/.well-known/openid-configuration')
+        google_params = json.load(googleinfo)
+        self.service = OAuth2Service(
+                name='google',
+                client_id=self.consumer_id,
+                client_secret=self.consumer_secret,
+                authorize_url=google_params.get('authorization_endpoint'),
+                base_url=google_params.get('userinfo_endpoint'),
+                access_token_url=google_params.get('token_endpoint')
+        )
+
+    def authorize(self):
+        return redirect(self.service.get_authorize_url(
+            scope='email',
+            response_type='code',
+            redirect_uri=self.get_callback_url())
+            )
+
+    def callback(self):
+        if 'code' not in request.args:
+            return None, None, None
+        oauth_session = self.service.get_auth_session(
+                data={'code': request.args['code'],
+                      'grant_type': 'authorization_code',
+                      'redirect_uri': self.get_callback_url()
+                     },
+                decoder = json.loads
+        )
+        me = oauth_session.get('').json()
+        return (me['name'],
+                me['email'])
+This creates a generic OAuthSignIn class that can be subclassed. The Google subclass pulls its information from Google's published list of information (in JSON format here). This is information that is subject to change, so this approach will make sure it is always up-to-date. One limitation of this is that if an Internet connection is not available on your server at the time the Flask application is initialized (the module imported), it will not be instantiated correctly. This should almost never be a problem, but storing last-known values in the configuration database to cover this eventuality is a good idea.
+
+Finally, the class returns a tuple of name, email in the callback() function. Google actually returns a lot more information, including the Google+ profile if available. Inspect the dictionary returned by oauth_session.get('').json() to see it all. If in the authorize() function you expand the scope (for my app, email is sufficient), you can get access to even more information through the Google API.
+
+Next, write the views to tie it all together:
+
+from flask.ext.login import login_user, logout_user, current_user, login_required
+
+@app.route('/authorize/<provider>')
+def oauth_authorize(provider):
+    # Flask-Login function
+    if not current_user.is_anonymous():
+        return redirect(url_for('index'))
+    oauth = OAuthSignIn.get_provider(provider)
+    return oauth.authorize()
+
+@app.route('/callback/<provider>')
+def oauth_callback(provider):
+    if not current_user.is_anonymous():
+        return redirect(url_for('index'))
+    oauth = OAuthSignIn.get_provider(provider)
+    username, email = oauth.callback()
+    if email is None:
+        # I need a valid email address for my user identification
+        flash('Authentication failed.')
+        return redirect(url_for('index'))
+    # Look if the user already exists
+    user=User.query.filter_by(email=email).first()
+    if not user:
+        # Create the user. Try and use their name returned by Google,
+        # but if it is not set, split the email address at the @.
+        nickname = username
+        if nickname is None or nickname == "":
+            nickname = email.split('@')[0]
+
+        # We can do more work here to ensure a unique nickname, if you 
+        # require that.
+        user=User(nickname=nickname, email=email)
+        db.session.add(user)
+        db.session.commit()
+    # Log in the user, by default remembering them for their next visit
+    # unless they log out.
+    login_user(user, remember=True)
+    return redirect(url_for('index'))
+Finally, my /login view and template to make it all happen:
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if g.user is not None and g.user.is_authenticated():
+        return redirect(url_for('index'))
+    return render_template('login.html',
+                           title='Sign In')
+login.html:
+
+{% extends "base.html" %}
+
+{% block content %}
+
+    <div id="sign-in">
+        <h1>Sign In</h1>
+        <p>
+        <a href={{ url_for('oauth_authorize', provider='google') }}><img src="{{ url_for('static', filename='img/sign-in-with-google.png') }}" /></a>
+    </div>
+{% endblock %}
+Make sure the correct callback addresses are registered with Google, and the user should simply have to click on "Sign in with Google" on your login page, and it will register them and log them in.
